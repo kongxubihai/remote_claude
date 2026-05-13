@@ -519,6 +519,47 @@ def save_lark_status(pid: int):
     status_file.write_text(json.dumps(status_data))
 
 
+def kill_all_lark_processes(exclude_pid: int = None) -> list:
+    """查找并杀死所有 lark_client 相关进程（排除指定 PID）
+
+    返回被杀死的 PID 列表
+    """
+    import signal
+    import time
+    killed = []
+
+    # 查找所有 lark_client.main 相关进程
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", "lark_client.main"],
+            capture_output=True, text=True, timeout=5
+        )
+        pids = [int(p) for p in result.stdout.strip().split('\n') if p.strip()]
+    except Exception:
+        return killed
+
+    for pid in pids:
+        if pid == exclude_pid or pid == os.getpid():
+            continue
+        try:
+            os.kill(pid, signal.SIGTERM)
+            killed.append(pid)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+    # 等待退出，必要时 SIGKILL
+    if killed:
+        time.sleep(1)
+        for pid in killed:
+            try:
+                os.kill(pid, 0)  # 检查是否还活着
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+
+    return killed
+
+
 def cleanup_lark():
     """清理飞书客户端残留文件"""
     pid_file = get_lark_pid_file()

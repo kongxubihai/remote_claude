@@ -11,6 +11,8 @@ import logging
 import os
 import signal
 import sys
+import threading
+import time
 import urllib.request
 from pathlib import Path
 
@@ -155,6 +157,7 @@ def handle_card_action(event: P2CardActionTrigger) -> P2CardActionTriggerRespons
         action_value = action.value or {}
 
         print(f"[Lark] 收到卡片动作: user={user_id[:8]}..., action={action_value}")
+        handler._ensure_health_check_started()
 
         # 检查用户白名单
         if not check_user_allowed(user_id):
@@ -398,6 +401,17 @@ class LarkBot:
         self.running = True
         print("\n机器人已启动，等待消息...")
         print("在飞书中发送 /help 查看使用说明\n")
+
+        # 在 ws_client.start() 阻塞前，保存事件循环引用，通过守护线程延迟启动健康检查
+        # （无需等待消息，15 秒后 WS 已连接就自动启动）
+        _loop = asyncio.get_event_loop()
+        def _deferred_health_check_start():
+            time.sleep(15)
+            try:
+                _loop.call_soon_threadsafe(handler._ensure_health_check_started)
+            except Exception as e:
+                print(f"[Lark] 健康检查启动失败: {e}")
+        threading.Thread(target=_deferred_health_check_start, daemon=True).start()
 
         # 启动 WebSocket（阻塞）
         self.ws_client.start()

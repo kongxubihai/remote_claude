@@ -34,7 +34,7 @@ from utils.session import (
     tmux_kill_session,
     list_active_sessions, is_session_active, cleanup_session,
     is_lark_running, get_lark_pid, get_lark_status, get_lark_pid_file,
-    save_lark_status, cleanup_lark,
+    save_lark_status, cleanup_lark, kill_all_lark_processes,
     USER_DATA_DIR, ensure_user_data_dir, get_lark_log_file,
     get_env_snapshot_path,
 )
@@ -214,9 +214,27 @@ def cmd_list(args):
     return 0
 
 
+def _find_session_by_pid(pid: int):
+    """通过 PID 查找对应会话名"""
+    for session in list_active_sessions():
+        if session.get("pid") == pid:
+            return session["name"]
+    return None
+
+
 def cmd_kill(args):
     """终止会话"""
     session_name = args.name
+
+    # 若参数是纯数字，按 PID 反查会话名
+    if session_name.isdigit():
+        pid = int(session_name)
+        matched = _find_session_by_pid(pid)
+        if not matched:
+            print(f"错误: 未找到 PID={pid} 对应的会话")
+            return 1
+        session_name = matched
+        print(f"PID {pid} 对应会话: {session_name}")
 
     # 检查会话是否存在
     if not is_session_active(session_name) and not tmux_session_exists(session_name):
@@ -307,6 +325,11 @@ def cmd_lark_start(args):
     ensure_socket_dir()
     ensure_user_data_dir()
 
+    # 启动前清理残留进程
+    stale = kill_all_lark_processes()
+    if stale:
+        print(f"  清理了 {len(stale)} 个残留进程: {stale}")
+
     # 启动守护进程（使用 -m 模块方式运行，确保相对导入正常工作）
     log_file = get_lark_log_file()
 
@@ -364,8 +387,11 @@ def cmd_lark_stop(args):
     print(f"正在停止飞书客户端 (PID: {pid})...")
 
     try:
-        # 发送 SIGTERM 信号
-        os.kill(pid, signal.SIGTERM)
+        # 杀整个进程组（uv 父进程 + Python 子进程一起杀）
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            os.kill(pid, signal.SIGTERM)  # 降级
 
         # 等待进程退出
         for i in range(50):  # 最多等待 5 秒
@@ -375,8 +401,16 @@ def cmd_lark_stop(args):
         else:
             # 如果还没退出，强制终止
             print("进程未响应，强制终止...")
-            os.kill(pid, signal.SIGKILL)
+            try:
+                os.killpg(os.getpgid(pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                os.kill(pid, signal.SIGKILL)
             time.sleep(0.5)
+
+        # 清理所有残留 lark_client 进程
+        stale = kill_all_lark_processes()
+        if stale:
+            print(f"  清理了 {len(stale)} 个残留进程: {stale}")
 
         if not is_lark_running():
             print("✓ 飞书客户端已停止")
@@ -389,6 +423,10 @@ def cmd_lark_stop(args):
             return 1
 
     except ProcessLookupError:
+        # 清理所有残留 lark_client 进程
+        stale = kill_all_lark_processes()
+        if stale:
+            print(f"  清理了 {len(stale)} 个残留进程: {stale}")
         print("进程已不存在，清理残留文件")
         cleanup_lark()
         _stop_watchdog()
@@ -817,7 +855,7 @@ def main():
 
     # kill 命令
     kill_parser = subparsers.add_parser("kill", help="终止会话")
-    kill_parser.add_argument("name", help="会话名称")
+    kill_parser.add_argument("name", help="会话名称或 PID")
     kill_parser.set_defaults(func=cmd_kill)
 
     # status 命令

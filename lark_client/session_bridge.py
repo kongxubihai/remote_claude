@@ -99,6 +99,7 @@ class SessionBridge:
 
     async def disconnect(self):
         """断开连接"""
+        logger.info(f"主动断开: session={self.session_name}, running={self.running}")
         self._manually_disconnected = True
         self.running = False
         if self._read_task:
@@ -173,6 +174,7 @@ class SessionBridge:
             try:
                 msg = await asyncio.wait_for(self._read_message(), timeout=1.0)
                 if msg is None:
+                    logger.info(f"read_loop 收到 EOF: session={self.session_name}")
                     self.running = False
                     break
                 if msg.type == MessageType.INPUT and self.on_input:
@@ -183,7 +185,7 @@ class SessionBridge:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.warning(f"读取错误: {e}")
+                logger.warning(f"读取错误: session={self.session_name}, error={e}")
                 break
 
         if self.on_disconnect and not self._manually_disconnected:

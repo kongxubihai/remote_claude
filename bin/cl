@@ -13,9 +13,6 @@ if ! command -v uv &>/dev/null; then
     [ -f "$HOME/.local/bin/uv" ] && export PATH="$HOME/.local/bin:$PATH"
 fi
 
-# 检查飞书配置
-source "$SCRIPT_DIR/scripts/check-env.sh" "$SCRIPT_DIR"
-
 # 会话名：第一个参数非 - 开头时作为自定义名，否则用 PWD_时间戳
 if [ -n "$1" ] && [[ "$1" != -* ]]; then
     SESSION_NAME="$1"

@@ -113,12 +113,13 @@ class SharedMemoryPoller:
         self._rapid_until.pop(chat_id, None)
 
         tracker = self._trackers.pop(chat_id, None)
+        session_name = tracker.session_name if tracker else "N/A"
         if tracker and tracker.reader:
             try:
                 tracker.reader.close()
             except Exception:
                 pass
-        logger.info(f"轮询器停止: chat_id={chat_id[:8]}...")
+        logger.info(f"轮询器停止: chat_id={chat_id[:8]}..., session={session_name}")
 
     def stop_and_get_active_slice(self, chat_id: str) -> Optional['CardSlice']:
         """停止轮询并返回活跃（未冻结）CardSlice，原子操作。供 detach/disconnect 就地更新卡片使用。"""
@@ -143,7 +144,8 @@ class SharedMemoryPoller:
             except Exception:
                 pass
 
-        logger.info(f"轮询器停止(含活跃切片): chat_id={chat_id[:8]}..., active={'有' if active else '无'}")
+        session_name = tracker.session_name if tracker else "N/A"
+        logger.info(f"轮询器停止(含活跃切片): chat_id={chat_id[:8]}..., session={session_name}, active={'有' if active else '无'}")
         return active
 
     def _on_task_done(self, task: asyncio.Task, chat_id: str) -> None:

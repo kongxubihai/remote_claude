@@ -87,42 +87,63 @@ class LarkHandler:
         self._detached_slices: Dict[str, CardSlice] = {}
         # 正在启动中的会话名集合（防止并发点击触发竞态）
         self._starting_sessions: set = set()
+        # Session 健康检查后台任务
+        self._health_check_task: Optional[asyncio.Task] = None
+        logger.info(
+            f"LarkHandler 初始化: bindings={len(self._chat_bindings)}, "
+            f"groups={len(self._group_chat_ids)}, "
+            f"binding_details={{{', '.join(f'{k[:8]}...→{v}' for k, v in self._chat_bindings.items())}}}"
+        )
 
     # ── 持久化绑定 ──────────────────────────────────────────────────────────
 
-    def _load_chat_bindings(self) -> Dict[str, str]:
+    def _load_json_file(self, path: Path):
+        """原子读取 JSON 文件，损坏时尝试从 .tmp 备份恢复"""
         try:
-            if self._CHAT_BINDINGS_FILE.exists():
-                return json.loads(self._CHAT_BINDINGS_FILE.read_text())
+            if path.exists():
+                content = path.read_text()
+                if content.strip():
+                    return json.loads(content)
+        except json.JSONDecodeError as e:
+            logger.warning(f"文件 {path.name} JSON 损坏: {e}，尝试恢复备份")
+            tmp_path = path.with_suffix('.json.tmp')
+            if tmp_path.exists():
+                try:
+                    content = tmp_path.read_text()
+                    if content.strip():
+                        result = json.loads(content)
+                        logger.warning(f"从 {tmp_path.name} 恢复成功")
+                        return result
+                except Exception:
+                    pass
         except Exception:
             pass
-        return {}
+        return None
+
+    def _atomic_write_json(self, path: Path, data):
+        """原子写入 JSON 文件：先写 .tmp 再 rename"""
+        try:
+            ensure_user_data_dir()
+            text = json.dumps(data, ensure_ascii=False)
+            tmp_path = path.with_suffix('.json.tmp')
+            tmp_path.write_text(text)
+            tmp_path.rename(path)
+        except Exception as e:
+            logger.warning(f"保存 {path.name} 失败: {e}")
+
+    def _load_chat_bindings(self) -> Dict[str, str]:
+        result = self._load_json_file(self._CHAT_BINDINGS_FILE)
+        return result if result is not None else {}
 
     def _save_chat_bindings(self):
-        try:
-            ensure_user_data_dir()
-            self._CHAT_BINDINGS_FILE.write_text(
-                json.dumps(self._chat_bindings, ensure_ascii=False)
-            )
-        except Exception as e:
-            logger.warning(f"保存绑定失败: {e}")
+        self._atomic_write_json(self._CHAT_BINDINGS_FILE, self._chat_bindings)
 
     def _load_group_chat_ids(self) -> set:
-        try:
-            if self._LARK_GROUP_IDS_FILE.exists():
-                return set(json.loads(self._LARK_GROUP_IDS_FILE.read_text()))
-        except Exception:
-            pass
-        return set()
+        result = self._load_json_file(self._LARK_GROUP_IDS_FILE)
+        return set(result) if result is not None else set()
 
     def _save_group_chat_ids(self):
-        try:
-            ensure_user_data_dir()
-            self._LARK_GROUP_IDS_FILE.write_text(
-                json.dumps(list(self._group_chat_ids), ensure_ascii=False)
-            )
-        except Exception as e:
-            logger.warning(f"保存群聊 ID 失败: {e}")
+        self._atomic_write_json(self._LARK_GROUP_IDS_FILE, list(self._group_chat_ids))
 
     def _remove_binding_by_chat(self, chat_id: str, force: bool = False):
         """移除 chat_id 的绑定。
@@ -131,6 +152,9 @@ class LarkHandler:
         """
         if not force and chat_id in self._group_chat_ids:
             return
+        session = self._chat_bindings.get(chat_id)
+        if session is not None:
+            logger.info(f"移除绑定: chat_id={chat_id[:8]}..., session={session}, force={force}")
         self._chat_bindings.pop(chat_id, None)
         self._save_chat_bindings()
 
@@ -139,6 +163,12 @@ class LarkHandler:
     async def _attach(self, chat_id: str, session_name: str,
                       user_id: Optional[str] = None) -> bool:
         """统一 attach 逻辑（私聊/群聊共用）"""
+        self._ensure_health_check_started()
+        logger.info(
+            f"[ATTACH] 开始: chat_id={chat_id[:8]}..., session={session_name}, "
+            f"old_session={self._chat_sessions.get(chat_id)}, "
+            f"old_bridge={'有' if chat_id in self._bridges else '无'}"
+        )
         # 在断开旧连接之前，先更新旧流式卡片为已断开状态
         old_session = self._chat_sessions.get(chat_id)
         old_slice = self._poller.stop_and_get_active_slice(chat_id)
@@ -165,11 +195,15 @@ class LarkHandler:
                                notify_user_id=user_id)
             _track_stats('lark', 'attach', session_name=session_name,
                          chat_id=chat_id)
+            logger.info(f"[ATTACH] 成功: chat_id={chat_id[:8]}..., session={session_name}")
             return True
+        logger.warning(f"[ATTACH] 失败: chat_id={chat_id[:8]}..., session={session_name}")
         return False
 
     async def _detach(self, chat_id: str):
         """统一 detach 逻辑（私聊/群聊共用）"""
+        session_name = self._chat_sessions.get(chat_id, "未知")
+        logger.info(f"[DETACH] chat_id={chat_id[:8]}..., session={session_name}")
         bridge = self._bridges.pop(chat_id, None)
         if bridge:
             await bridge.disconnect()
@@ -185,7 +219,12 @@ class LarkHandler:
             logger.info(f"会话 '{session_name}' 旧连接断线（已被替换），跳过清理")
             return
 
-        logger.info(f"会话 '{session_name}' 断线, chat_id={chat_id[:8]}...")
+        bridge_running = disconnected_bridge.running if disconnected_bridge else "N/A"
+        logger.info(f"会话 '{session_name}' 断线, chat_id={chat_id[:8]}..., bridge_running={bridge_running}")
+        logger.info(
+            f"[DISCONNECT] 状态快照: bridges={[k[:8] for k in self._bridges]}, "
+            f"sessions={{{', '.join(f'{k[:8]}→{v}' for k, v in self._chat_sessions.items())}}}"
+        )
         _track_stats('lark', 'disconnect', session_name=session_name,
                      chat_id=chat_id)
         active_slice = self._poller.stop_and_get_active_slice(chat_id)
@@ -196,13 +235,19 @@ class LarkHandler:
         # 只有用户主动 /detach 或 /kill 时才清除绑定
 
         if active_slice:
-            await self._update_card_disconnected(chat_id, session_name, active_slice)
+            updated = await self._update_card_disconnected(chat_id, session_name, active_slice)
+            if not updated:
+                # 就地更新失败 → 降级发新卡片，确保用户看到断开状态
+                logger.warning(f"断线卡片就地更新失败，降级发送新卡: {chat_id[:8]}...")
+                card = build_stream_card([], disconnected=True, session_name=session_name)
+                await card_service.create_and_send_card(chat_id, card)
 
     # ── 消息入口 ────────────────────────────────────────────────────────────
 
     async def handle_message(self, user_id: str, chat_id: str, text: str,
                               chat_type: str = "p2p"):
         """处理用户消息（群聊/私聊统一路由）"""
+        self._ensure_health_check_started()
         logger.info(f"收到消息: user={user_id[:8]}..., chat={chat_id[:8]}..., type={chat_type}, text={text[:50]}")
         text = text.strip()
 
@@ -280,6 +325,7 @@ class LarkHandler:
 
         ok = await self._attach(chat_id, session_name, user_id=user_id)
         if ok:
+            logger.info(f"[BINDING] 写入: chat_id={chat_id[:8]}..., session={session_name}, source=cmd_attach")
             self._chat_bindings[chat_id] = session_name
             self._save_chat_bindings()
             if message_id:
@@ -406,6 +452,7 @@ class LarkHandler:
 
             ok = await self._attach(chat_id, session_name, user_id=user_id)
             if ok:
+                logger.info(f"[BINDING] 写入: chat_id={chat_id[:8]}..., session={session_name}, source=cmd_start")
                 self._chat_bindings[chat_id] = session_name
                 self._save_chat_bindings()
             else:
@@ -520,6 +567,7 @@ class LarkHandler:
 
         # 清理所有残留绑定（包括已断开的群聊，其绑定在断开时被保留）
         for cid in [c for c, s in list(self._chat_bindings.items()) if s == session_name]:
+            logger.info(f"[KILL] 清理残留绑定: chat_id={cid[:8]}..., session={session_name}, is_group={'是' if cid in self._group_chat_ids else '否'}")
             self._group_chat_ids.discard(cid)
             self._chat_bindings.pop(cid, None)
         self._save_chat_bindings()
@@ -547,7 +595,7 @@ class LarkHandler:
 
     async def _update_card_disconnected(self, chat_id: str, session_name: str,
                                         active_slice: 'CardSlice') -> bool:
-        """读取最新 blocks 并就地更新卡片为断开状态（disconnected=True）。Best-effort，不降级发新卡。"""
+        """读取最新 blocks 并就地更新卡片为断开状态（disconnected=True）。返回是否成功。"""
         blocks = []
         try:
             import sys as _sys
@@ -795,6 +843,7 @@ class LarkHandler:
             self._save_chat_bindings()
             self._group_chat_ids.add(group_chat_id)
             self._save_group_chat_ids()
+            logger.info(f"创建群聊成功: group_chat_id={group_chat_id[:8]}..., session={session_name}")
             # 立即 attach，让新群即刻开始接收 Claude 输出
             await self._attach(group_chat_id, session_name, user_id=user_id)
 
@@ -868,6 +917,68 @@ class LarkHandler:
             self._save_chat_bindings()
             self._save_group_chat_ids()
 
+    # ── Session 健康检查 ─────────────────────────────────────────────────────
+
+    HEALTH_CHECK_INTERVAL = 30  # 秒
+
+    def _ensure_health_check_started(self):
+        """懒启动健康检查后台任务（首次收到消息时调用）"""
+        if self._health_check_task is None or self._health_check_task.done():
+            self._health_check_task = asyncio.create_task(self._health_check_loop())
+            logger.info("Session 健康检查后台任务已启动")
+
+    async def _health_check_loop(self):
+        """定期检查绑定的 session 是否仍然存活"""
+        while True:
+            await asyncio.sleep(self.HEALTH_CHECK_INTERVAL)
+            try:
+                await self._session_health_check()
+            except Exception as e:
+                logger.error(f"健康检查异常: {e}", exc_info=True)
+
+    async def _session_health_check(self):
+        """扫描所有绑定关系，对已死亡 session 自动解散群聊、清理私聊绑定"""
+        bound_sessions = set(self._chat_bindings.values())
+        if not bound_sessions:
+            return
+
+        active = {s["name"] for s in list_active_sessions()}
+        dead_sessions = bound_sessions - active
+        if not dead_sessions:
+            return
+
+        for session_name in dead_sessions:
+            logger.info(f"[health-check] 检测到 session '{session_name}' 已关闭")
+
+            # 记录受影响的 chat_id（在 disband 修改 dict 之前）
+            affected_chats = [
+                cid for cid, sname in list(self._chat_bindings.items())
+                if sname == session_name
+            ]
+
+            # 解散群聊（复用已有逻辑，内部会清理群聊的绑定/轮询/bridge）
+            await self._disband_groups_for_session(session_name, source="health-check")
+
+            # 处理私聊绑定（非群聊的 chat_id）
+            cleaned_private = False
+            for cid in affected_chats:
+                if cid in self._group_chat_ids:
+                    continue  # 群聊已由 _disband_groups_for_session 处理
+                if self._chat_bindings.get(cid) != session_name:
+                    continue  # 已被其他逻辑清理
+                logger.info(f"[health-check] 清理私聊绑定: chat_id={cid[:8]}..., session={session_name}")
+                self._poller.stop(cid)
+                bridge = self._bridges.pop(cid, None)
+                if bridge:
+                    await bridge.disconnect()
+                self._chat_sessions.pop(cid, None)
+                self._detached_slices.pop(cid, None)
+                self._remove_binding_by_chat(cid, force=True)
+                cleaned_private = True
+
+            if cleaned_private:
+                self._save_chat_bindings()
+
     async def _cmd_disband_group(self, user_id: str, chat_id: str, session_name: str,
                                   message_id: Optional[str] = None):
         """解散与指定会话绑定的专属群聊"""
@@ -885,6 +996,7 @@ class LarkHandler:
                 logger.error(f"解散群 API 失败: {feishu_msg}")
 
             # 无论 Feishu delete 是否成功，都清理本地绑定
+            logger.info(f"[DISBAND] 单群解散: group_chat_id={group_chat_id[:8]}..., session={session_name}")
             self._group_chat_ids.discard(group_chat_id)
             self._save_group_chat_ids()
             self._remove_binding_by_chat(group_chat_id, force=True)
@@ -907,6 +1019,8 @@ class LarkHandler:
         bridge = self._bridges.get(chat_id)
         if bridge and bridge.running:
             return bridge
+        if bridge and not bridge.running:
+            logger.info(f"bridge 存在但已停止: chat_id={chat_id[:8]}..., session={self._chat_sessions.get(chat_id)}")
         # 尝试从持久化绑定恢复
         saved_session = self._chat_bindings.get(chat_id)
         if saved_session:
@@ -914,11 +1028,28 @@ class LarkHandler:
             ok = await self._attach(chat_id, saved_session, user_id=user_id)
             if ok:
                 return self._bridges.get(chat_id)
-            # 恢复失败：会话已不存在，清除绑定
+            # 区分临时失败和永久失败
+            sessions = list_active_sessions()
+            if any(s["name"] == saved_session for s in sessions):
+                # 会话存在但连接失败 → 临时性故障，保留绑定供重试
+                logger.warning(f"自动恢复失败（临时性）: session={saved_session}, 保留绑定")
+                return None
+            # 会话已不存在 → 永久失败，级联清除
+            logger.warning(f"会话 '{saved_session}' 已不存在，清除绑定: chat_id={chat_id[:8]}...")
+            # 1. 先停止当前 chat_id 的轮询器和 bridge
+            self._poller.stop(chat_id)
+            stale_bridge = self._bridges.pop(chat_id, None)
+            if stale_bridge:
+                await stale_bridge.disconnect()
+            self._chat_sessions.pop(chat_id, None)
+            self._detached_slices.pop(chat_id, None)
+            # 2. 清除绑定
             self._group_chat_ids.discard(chat_id)
-            self._save_group_chat_ids()
             self._remove_binding_by_chat(chat_id, force=True)
+            # 3. 解散同会话的其他群聊（内部会清理各自的轮询器/bridge/绑定）
             await self._disband_groups_for_session(saved_session, source="lazy")
+            # 4. 确保持久化保存（disband 按绑定匹配遍历，已在上面移除绑定，确保保存）
+            self._save_group_chat_ids()
         return None
 
     async def _forward_to_claude(self, user_id: str, chat_id: str, text: str):
@@ -945,6 +1076,7 @@ class LarkHandler:
         发箭头键导航到目标选项，每步从共享内存读取 selected_value 确认是否到位，
         到位后发 Enter 确认。避免数字键在溢出选项上无效的问题。
         """
+        self._ensure_health_check_started()
         logger.info(f"处理选项选择: user={user_id[:8]}..., option={option_value}, total={option_total}")
         _track_stats('lark', 'option_select',
                      session_name=self._chat_sessions.get(chat_id, ''),
@@ -1139,14 +1271,15 @@ class LarkHandler:
             await card_service.send_text(chat_id, f"❌ 无法解析按键：`{combo}`\n使用 `/press` 查看支持的按键格式")
             return
 
-        bridge = self._bridges.get(chat_id)
-        if not bridge or not bridge.running:
+        bridge = await self._ensure_bridge(chat_id, user_id=user_id)
+        if not bridge:
             await card_service.send_text(chat_id, "❌ 当前未连接到会话，请先使用 /attach 连接")
             return
 
         success = await bridge.send_raw(raw)
         if success:
             logger.info(f"[press] 发送按键 {combo!r} ({raw!r}) 到会话")
+            self._poller.kick(chat_id)
         else:
             await card_service.send_text(chat_id, f"❌ 发送按键 `{combo}` 失败")
 
@@ -1241,6 +1374,10 @@ class LarkHandler:
 
     async def disconnect_all_for_shutdown(self) -> None:
         """lark stop 时清理所有活跃流式卡片（更新为已断开状态）"""
+        # 停止健康检查
+        if self._health_check_task and not self._health_check_task.done():
+            self._health_check_task.cancel()
+        logger.info(f"[SHUTDOWN] 开始清理: bridges={len(self._bridges)}, sessions={len(self._chat_sessions)}")
         chat_ids = list(self._bridges.keys())
         for chat_id in chat_ids:
             session_name = self._chat_sessions.get(chat_id, "")
